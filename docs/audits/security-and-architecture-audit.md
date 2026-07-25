@@ -500,4 +500,115 @@ Two questions, two answers:
 - Targeted `Read` of every file in Appendix A (full or specific line ranges).
 - Four parallel sub-audits (supply-chain, credentials, orchestration/reliability, dangerous-paths/renderer), each source-tracing its domain and cross-checked against primary reads above.
 
-*End of report.*
+---
+
+# Verification and Reclassification Addendum
+
+**Added:** 2026-07-25 (same commit). This addendum records a focused, adversarial re-verification of the ten highest-impact findings: each was re-traced end-to-end in source by an independent verifier, then a second independent reviewer attempted to *overturn* the verdict. Where the source narrowed or corrected the original claim, the reclassification and the reasoning are recorded here. **This addendum supersedes the body where they differ.**
+
+## What changed at a glance
+
+- **4 findings narrowed by evidence:** F4 (command injection is **non-escalating** in the god trust domain — not an exploitable RCE), F7 (cross-user socket connect is **closed by the default umask** — original implied otherwise), F9 (→ **Operational risk**, git-recoverable, no security barrier crossed), F10 (→ **Operational risk**, pathological figures gated on non-default conditions).
+- **1 exec-summary sentence withdrawn:** the chat sentence grouping "`ensureClaudePermissionsAccepted` **and** the opt-in Slack/webhook servers expose the machine to authenticated remote task-injection" **conflated two unrelated things.** `ensureClaudePermissionsAccepted` (F3) is a purely **local** `~/.claude` mutation with **no role in remote exposure**. That portion is withdrawn; F3 and F6 are separate findings.
+- **1 factual correction inside F1:** the body said `commandForAutoMode` (`config.ts:458`) attaches the bypass flag. That function is **dead code (no caller)**; the flag is actually attached by the **renderer** `buildSpawnCommand` (`src/renderer/src/store/config.ts:291`). More importantly, **god-spawned ephemeral workers do *not* inherit the bypass flag** — `processSpawnRequest` (`index.ts:3106-3138`) passes bare `claude` with only `--model`, so a default worker runs **approval-gated**, not in bypass mode. "Externally submitted tasks inherit autoMode" is therefore **false for the worker path**.
+- **5 findings confirmed as stated** (label held, with precisions): F1, F2, F5, F6, F8.
+
+## Reconciled classification table
+
+| # | Finding | Original | **Verified classification** | Default-on? | Remotely reachable? | Model-controlled? | Patch priority |
+|---|---|---|---|---|---|---|---|
+| F1 | autoMode → permission-bypass default | High | **Confirmed unsafe design/default** | **Yes** (renderer god/agents; *not* workers) | Indirect (god ingests remote text) | n/a (config) | **P1** |
+| F2 | Full `process.env` inheritance | High | **Confirmed unsafe design/default** (intended-but-dangerous) | Yes | No (local) | Enumerable via `env` in bypass shell | P2 |
+| F3 | Global `~/.claude` mutation | High | **Confirmed unsafe design/default** (scope narrowed) | Yes (claude spawns only) | No | No | P2 |
+| F4 | Spawn-request `command` → `which ${command}` | High (exploitable) | **Defense-in-depth weakness** (injection, non-escalating) + **unsafe design** (arbitrary binary by design) | Yes (path live) | Yes (via injected god) | **Yes** | **P1** |
+| F5 | No hard cost/runtime ceiling | High | **Confirmed unsafe design/default** | Yes | Yes (via god) | Yes | **P1** |
+| F6 | Remote task injection (Slack/webhook) | High | **Confirmed unsafe design/default** | **No** (opt-in) | Yes (when enabled) | Yes | P2 (P1 if enabled) |
+| F7 | Unauth hook UDS trusts `agent_id` | Medium | **Defense-in-depth weakness** (same-user only) | Yes (socket exists) | No (cross-user closed by umask) | Same-user forge only | P3 |
+| F8 | Plaintext secrets + renderer IPC | Medium | **Confirmed unsafe design/default** (renderer-exfil narrowed by CSP) | Yes (when secrets set) | No | No | P2 |
+| F9 | Non-atomic state writes | Medium | **Operational risk** (git-recoverable, fail-closed) | Yes | No | No | P3 |
+| F10 | Main-thread git spin-lock | Low | **Operational risk** (typical <100 ms) | Yes | No | No | P3 |
+
+## Per-finding reconciliation
+
+### F1 — Default permission bypass → **Confirmed unsafe design/default** (upheld, with corrections)
+- **Call path (corrected):** first-run gate `App.tsx:194` (nothing spawns until `onboardingComplete`) → `OnboardingWizard.tsx:91` (autoMode toggle **pre-checked ON**, with explicit "bypassPermissions / foot-gun on production repos" copy, `tsx:511-552`) → `updateConfig({autoMode})` → god boot `useHive.ts:232-239` → `buildSpawnCommand` appends `preset.autoFlag` **iff** `config.autoMode` (`store/config.ts:291`) → `pty:spawn` → `pty.ts:270` launches `claude --permission-mode bypassPermissions`.
+- **Corrections:** `commandForAutoMode` (`config.ts:458`) is **dead code**; workers do **not** get the flag (`index.ts:3106-3138`); `spawnAgentCore`'s claude block never adds a permission-mode flag (`index.ts:1943-1983`). `readConfig` merges `DEFAULTS` **under** parsed (`config.ts:390`), so any config missing the key silently resolves to `true`.
+- **Containment present:** onboarding gate + disclosure; a functioning `autoMode:off` path (flag omitted, `HIVE_AUTO_APPROVE=0`, OpenCode `permission:allow` gated); workers default to approval-gated.
+- **Minimal patch:** default `autoMode:false`; make the onboarding toggle default-off and require an explicit opt-in; keep the flag out of `readConfig`'s silent merge (treat missing key as `false`).
+- **Residual after patch:** a user can still opt into bypass; that is acceptable if paired with real isolation.
+
+### F2 — Full environment inheritance → **Confirmed unsafe design/default** (upheld)
+Every child inherits the full env: PTY agents (`pty.ts:275`), hidden claude (`hiddenClaude.ts:135`), git (`git.ts:10`), gh (`github.ts`), proxy sidecar (`hive.ts:803`), mempalace (`memory.ts`), reflect (`reflect.ts:285`), PATH probes (`shellEnv.ts`). No filter anywhere; an agent in bypass mode can `env`-dump `SSH_AUTH_SOCK`/`AWS_*`/`GITHUB_TOKEN`. **Adversary's fair point:** this is the ubiquitous default of every terminal/IDE (Node defaults child env to `process.env`; stripping it breaks the very CLIs the app launches) — so the fix is an **allowlist with per-agent overrides**, not blanket stripping. **Minimal patch:** build child env from a base allowlist (`PATH`, `HOME`, `TERM`, `LANG`, locale, provider-config vars) + explicit per-agent additions; drop `SSH_AUTH_SOCK`/`AWS_*`/`*_TOKEN`/`*_KEY` unless a per-agent grant opts them in.
+
+### F3 — Global Claude settings mutation → **Confirmed unsafe design/default** (scope narrowed)
+Confirmed: `config.ts:490-523` sets `skipDangerousModePermissionPrompt`+`skipAutoPermissionPrompt` in global `~/.claude/settings.json` (merge-preserving other keys) and accumulates per-cwd `hasTrustDialogAccepted` in `~/.claude.json`; silent, no restore, only the `config.ts` writer exists. **Narrowing:** per the code's own docstring, those two keys suppress the **bypass-mode warning** and the **auto-permission prompt** — they do **not by themselves flip Claude into bypass mode** (the CLI flag does that). Harm = consent-free, non-restorable, global suppression of a safety warning + trust accumulation across all future Claude sessions, not "silently enables bypass everywhere." Only triggers on **claude** spawns (default provider). **Minimal patch:** never write the user's global config; pass a harness-local `--settings <hiveHome>/claude-settings.json` (already partly done for hooks) carrying these keys, and set folder trust only within that scoped settings file.
+
+*Before → after example (representative existing `~/.claude/settings.json`):*
+```
+BEFORE: { "model": "claude-sonnet-4-6", "hooks": { "PreToolUse": [...] } }
+AFTER : { "model": "claude-sonnet-4-6", "hooks": { "PreToolUse": [...] },
+         "skipDangerousModePermissionPrompt": true, "skipAutoPermissionPrompt": true }
+```
+Other keys are preserved (read-modify-write); the two keys are added globally and never removed.
+
+### F4 — Model-controlled spawn / `which ${command}` → **Defense-in-depth weakness** (was "exploitable vulnerability")
+- **Mechanism confirmed:** `raw.command` is unvalidated (`index.ts:3106`), `bin` is only used for the availability check, and the **full** `command` reaches `` which ${command} `` under `$SHELL -ilc` (`pty.ts:183`); the slash short-circuit (`pty.ts:144`) is not a security control. Args **are** safely argv-encoded (`index.ts:3137` → `pty.ts:268,270`), and the final PTY launch is **non-shell**.
+- **Why narrowed:** every entity that can write a spawn-request `command` (god, workers) is reachable only via the shared `HIVE_ROOT` handed to agents that **already run `bypassPermissions`** with an unrestricted shell in the **identical** trust domain (`index.ts:2004`). So the shell-injection runs as the **same principal** that already has arbitrary exec — **zero escalation**. It is a genuine code defect, not an exploitable privilege gain.
+- **The one real (narrow) escalation:** a **worker** runs *approval-gated* (F1 correction). The `which ${command}` sink executes **outside** the CLI permission system, in the main process's shell, during resolution. So a prompt-injected worker that authors a spawn-request for another worker could run a shell payload the worker's own tool-approval gate would have blocked. Bounded (god already has bypass), but it is why the injection must still be fixed.
+- **Distinctions the task asked for:** (a) **shell-injection** — real, via `which ${command}`; (b) **arbitrary-binary-by-design** — remains after fixing (a), because `command` may name any resolvable binary; (c) **prompt-injection reachability** — yes: remote/inbox/web/repo text → god → spawn-request; (d) **remote reachability** — only when Slack/webhook enabled (F6).
+- **Minimal patch:** a typed default-deny **engine registry** (mirroring `shared/hire.ts`): `command` must resolve to an allowlisted engine id (`claude`/`codex`/`antigravity`), never a free-form string; and replace `` which ${command} `` with `execFile`-style resolution (no shell). **Residual:** `raw.model` still unvalidated by `MODEL_RE` — safe on unix argv but should get the hire `MODEL_RE` for the Windows `cmd.exe` routing path.
+
+### F5 — Unbounded cost/runtime → **Confirmed unsafe design/default** (upheld, with nuance)
+Confirmed: `hardStop:false` (breaker never kills), no cost/token/turn caps, `defaultWorkerTokenCap:0`, god excluded from the breaker. **Nuances the verification added:** `maxConcurrentWorkers:4` **is** enforced (`index.ts:3295`) so *instantaneous* concurrency is capped (no fork-bomb of thousands of PTYs); `tokenVelocityPerMin:60000` is a default but only steers/constrains; the 20-min idle reaper (`index.ts:3276`) is a genuine hard-kill but is **output-age-keyed**, so a chatty loop evades it. **Net:** *cumulative* cost/tokens/wall-clock are unbounded per worker; *sequential/total* spawns are unbounded (a worker can enqueue more spawn-requests, processed 4-at-a-time). **Minimal patch:** default-on hard caps — per-worker wall-clock + token ceiling with a **deterministic kill** (not a steer), an aggregate spend ceiling across the fleet, and a total-spawn budget per task/experiment.
+
+### F6 — Remote task injection → **Confirmed unsafe design/default** (upheld) + conflation withdrawn
+Opt-in (off by default), bind `0.0.0.0` (`slack.ts:179`, `webhook.ts:141`), public via tunnelmole, **authenticated** (HMAC / 192-bit secret, constant-time, replay window, rate limit, body cap, no enumeration). Authorization is **all-or-nothing** (any valid caller injects arbitrary task text into god). Once enabled and with `autoMode` on, that text drives autonomous bypass execution. Indirect prompt-injection via fetched web/repo content is also real (god/worker reads untrusted content). **Withdrawn:** the exec-summary sentence tying `ensureClaudePermissionsAccepted` to remote exposure — it is a local mutation (F3), unrelated. **Minimal patch:** bind loopback + require an explicit "expose publicly" confirmation; scope the secret to a capability (e.g. read-only status vs task-create); keep these off unless the operator opts in per session.
+
+### F7 — Hook UDS → **Defense-in-depth weakness** (was Medium; cross-user claim corrected)
+- **Correction:** the socket is `<hiveRoot>/hooks.sock` (`hive.ts:313`) created by `listen()` as `0o777 & ~umask`; under the **standard umask 022** it is `0o755` — neither group nor other holds **write**, and Linux enforces write permission on `connect(2)` to a UNIX socket, so **other/group users CANNOT connect**. The cross-user vector is **closed by default**, opening only under a laxer-than-default umask. (The original finding implied cross-user connectivity; that is corrected.)
+- **What remains:** a **same-user** process — i.e. an agent's own tools in bypass mode — can connect and forge another agent's `agent_id`, causing state corruption (advance another agent's `cursor.json` → silent message loss), sessionId poisoning, breaker trips, or cost-ledger pollution. **No path to process spawn** — the handler only returns control decisions and mutates state. A same-user process is already privileged, so this is defense-in-depth, not a new capability. The desktop-toast sink is additionally gated on `notifications:false` (default).
+- **Minimal patch:** `chmodSync(sock, 0o600)` after `listen` + create the hive root `0o700` (closes cross-user regardless of umask); a per-root `HIVE_HOOK_TOKEN` injected into the shim env and checked in `handle()` (binds payloads to spawned agents). **Residual:** a same-user compromised agent can read its own `HIVE_HOOK_TOKEN` and still forge — unfixable without OS-level agent isolation, but it already has direct FS write to those state files.
+
+### F8 — Plaintext secrets + renderer exposure → **Confirmed unsafe design/default** (upheld; one leg narrowed)
+Confirmed: `slackBotToken`/`slackSigningSecret`/`webhookSecret`/`groqApiKey` are plaintext on `HarnessConfig` (`config.ts:263,265,285,308`); `writeConfig` writes with no mode (`config.ts:408`) → **0644**, versus the broker's explicit **0600** (`integrations.ts:102`); `config:get`/`config:update` return them **unredacted** (`index.ts:2208-2209`) and `SettingsModal` renders them. **Narrowing:** the renderer-exfil leg is bounded by the real CSP (`script-src 'self'`, `connect-src` self+OpenAI) — a renderer compromise can't POST them to an arbitrary host, though it could still read them or route via an allowed sink. The at-rest 0644 plaintext + unredacted IPC, next to a codebase that encrypts everything else, is the core defect. **Minimal patch:** move the four into the existing `safeStorage` broker; expose only `hasX` booleans + write-only setters (the broker's own pattern); stop returning them via `config:get`.
+
+### F9 — Non-atomic state writes → **Operational risk** (was Medium defense-in-depth)
+Mechanism confirmed (`writeJson` truncate+write, `hive.ts:1565`; only inbox delivery uses `atomicWriteJson`). **Reclassified:** no security barrier is crossed. Every torn-read recovery is **fail-closed and benign** — `readJson` falls back to `{godId:null,agents:{}}` (`hive.ts:1562-1563`); `archiveOrphanedAgents` on an empty registry is a **no-op** (it only archives entries it finds), not a destructive purge; the hive is a git repo so prior state is **recoverable from history**; and the **single-instance lock** (`index.ts:1458`) rules out multi-instance races. Real severity = transient availability + a small crash-durability window. **Minimal patch:** route all state writes through `atomicWriteJson` (tmp+`rename`) and add a single-writer lock for `tasks.json` (which has a second, human/GOD editor). **Fault-injection test:** write a truncated `registry.json`, start the router, assert it degrades (empty roster) without deleting `agents/*` and recovers on the next good write.
+
+### F10 — Main-thread git spin-lock → **Operational risk** (was Low)
+Mechanism confirmed: `commit()` (`hive.ts:1583`) runs synchronous `spawnSync git` (8 s timeout) with a 5-attempt retry using `sleepSync`=`Atomics.wait` (`hive.ts:179`) on the **Electron main thread**. **Reclassified:** the alarming figures (750 ms cumulative sleep; ~40 s if git hangs 5×; deferred breaker beat) are all gated on **non-default** conditions — the 750 ms backoff only runs on the `index.lock` contention branch, `commit()` is a **single serialized main-thread committer** so it rarely contends, and typical commits are <100 ms. It is a reliability/latency risk, not security (the "freezes security prompts" angle is moot — prompts are bypassed). **Minimal patch:** move git off the loop (worker thread or a queued async committer); replace `Atomics.wait` backoff with an async delay.
+
+## Closing answers
+
+**1. Confirmed exactly as originally stated (label held, precisions added):** **F1, F2, F5, F6, F8** — all five remain **Confirmed unsafe design/default**. (F1 carries the internal factual corrections about `commandForAutoMode`/workers; the *classification* is unchanged.)
+
+**2. Narrowed or corrected:**
+- **F4** — from "confirmed exploitable RCE" to **defense-in-depth weakness**: a real command-injection defect that grants **no escalation** in the god trust domain (writers already have bypass shells); the arbitrary-binary-by-design aspect is the unsafe-design half. Fix still required.
+- **F7** — from Medium/"other local users can connect" to **defense-in-depth weakness**: cross-user connect is **closed by the default umask**; only same-user forging remains, with **no RCE path**.
+- **F9** — to **Operational risk**: git-recoverable, fail-closed, single-instance-locked; no security barrier crossed.
+- **F10** — to **Operational risk**: pathological figures gated on non-default conditions.
+- **F3** — label held but **scope narrowed** (the two keys suppress a warning + prompt, not "enable bypass").
+- **Withdrawn:** the exec-summary sentence conflating `ensureClaudePermissionsAccepted` with remote exposure.
+
+**3. The three patches that must land before any experimental use *outside a throwaway VM*:**
+1. **F1 — make `autoMode` opt-in** (default off; treat a missing config key as off) **or** enforce a real, non-bypassable per-tool policy at the hook `PreToolUse` boundary. This is the master control; everything else is a multiplier on it.
+2. **F5 — hard, default-on cost/runtime ceilings** (per-worker wall-clock + token cap with a **deterministic kill**, plus an aggregate fleet/experiment budget). Prevents one injected/looping agent from unbounded spend.
+3. **F4 — typed allowlisted engine registry + de-shelled command resolution** (no free-form `command`, no `which ${command}`). Closes model-controlled binary selection and the injection in one move.
+*(Runners-up before non-experimental use: F3 stop mutating global `~/.claude`; F8 move the four secrets into the broker.)*
+
+**4. Is a disposable, credential-free VM sufficient containment for testing the *unmodified* fork? — Yes.** Every one of the ten findings operates **within the user account**; the app provides **no isolation of its own** (Section 9), so the VM boundary is precisely the missing containment. A properly configured throwaway VM makes it safe to test the unmodified fork, provided the conditions in (5) are met (no real credentials in the VM's environment, no network reach to other hosts/secrets, Slack/webhook off, and a spend-capped or local model so F5's unbounded spend can't hurt).
+
+**5. Precise safe-testing VM configuration:**
+- **Disposable VM/container**, snapshot before use, discard after. Non-root user; run the app as that user.
+- **Environment scrubbed of credentials:** no `SSH_AUTH_SOCK` (don't forward the agent), no `AWS_*`/`GCP`/`AZURE_*`, no `GITHUB_TOKEN`/`GH_TOKEN`, no `.aws/`, no real `~/.ssh` keys, no git credential helper with real creds (F2 means agents inherit all of it).
+- **Model access that can't cause runaway cost (F5):** prefer a **local model** (Ollama/LM Studio via the provider base-URL path) so no paid API is reachable; if a hosted key is required, use a **dedicated key with a hard billing cap**, not a primary credential.
+- **Network isolation:** outbound restricted to only the model endpoint you chose; **Slack and webhook left OFF** (they are off by default — keep them off, F6); do **not** start a tunnelmole tunnel.
+- **Throwaway repos only:** point `harnessHome` and registered repos at scratch clones with no secrets and no push credentials; the god/agents run `bypassPermissions`, so treat everything in the VM as writable-by-the-agents.
+- **Expect global-config mutation inside the VM (F3):** `~/.claude/settings.json` and `~/.claude.json` will be modified — fine inside a disposable home; do not reuse that home elsewhere.
+- **Treat all agent output as untrusted;** review branches/worktrees before extracting anything from the VM.
+
+Under that configuration the unmodified fork can be exercised safely; the three patches above are what convert it from "safe only inside a throwaway VM" to "safe to run against real work."
+
+---
+
+*End of report (with Verification and Reclassification Addendum).*
