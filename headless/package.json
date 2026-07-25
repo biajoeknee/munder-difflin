@@ -1,0 +1,16 @@
+{
+  "name": "munder-headless-slice",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Phase 4 investigation artifact: one headless execution path through Munder's unmodified main-process orchestration modules — no Electron, no renderer.",
+  "scripts": {
+    "build": "node build.mjs",
+    "slice": "node build.mjs && node dist/run.cjs"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}
